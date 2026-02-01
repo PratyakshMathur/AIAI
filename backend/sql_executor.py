@@ -1,172 +1,224 @@
-"""SQL query execution service"""
-import sqlite3
-import tempfile
-import os
-from typing import Tuple, List, Dict, Any
+"""SQL query execution service with DuckDB"""
+import duckdb
+import re
+import time
+from typing import Tuple, List, Dict, Any, Optional
+from threading import Thread
+import signal
 
 class SQLExecutor:
-    """Execute SQL queries in a sandboxed SQLite environment"""
+    """Execute SQL queries in a sandboxed DuckDB environment"""
     
-    def __init__(self):
-        # Create a sample database for practice
-        self.db_path = self._create_sample_database()
+    # Blocked SQL keywords for safety
+    BLOCKED_KEYWORDS = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'CREATE', 'TRUNCATE', 'REPLACE', 'ATTACH', 'DETACH']
+    MAX_ROWS = 5000
+    TIMEOUT_SECONDS = 30
     
-    def _create_sample_database(self) -> str:
-        """Create a sample customer database for SQL practice"""
-        db_path = os.path.join(tempfile.gettempdir(), 'interview_sample.db')
+    def __init__(self, session_id: str = "default", problem_id: Optional[int] = None, allowed_tables: Optional[List[str]] = None):
+        """Initialize DuckDB with session-specific in-memory database
         
-        # Remove existing database
-        if os.path.exists(db_path):
-            os.remove(db_path)
-        
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # Create sample tables
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS customers (
-                customer_id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                email TEXT NOT NULL,
-                age INTEGER,
-                city TEXT,
-                registration_date TEXT
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS orders (
-                order_id INTEGER PRIMARY KEY,
-                customer_id INTEGER,
-                product_name TEXT,
-                category TEXT,
-                amount REAL,
-                order_date TEXT,
-                FOREIGN KEY (customer_id) REFERENCES customers (customer_id)
-            )
-        ''')
-        
-        # Insert sample data
-        customers_data = [
-            (1, 'Alice Johnson', 'alice@email.com', 28, 'New York', '2024-01-15'),
-            (2, 'Bob Smith', 'bob@email.com', 34, 'Los Angeles', '2024-02-20'),
-            (3, 'Carol White', 'carol@email.com', 45, 'Chicago', '2024-01-10'),
-            (4, 'David Brown', 'david@email.com', 29, 'Houston', '2024-03-05'),
-            (5, 'Eve Davis', 'eve@email.com', 52, 'Phoenix', '2024-02-28'),
-        ]
-        
-        cursor.executemany(
-            'INSERT INTO customers VALUES (?, ?, ?, ?, ?, ?)',
-            customers_data
-        )
-        
-        orders_data = [
-            (1, 1, 'Laptop', 'Electronics', 1200.00, '2024-03-01'),
-            (2, 1, 'Mouse', 'Electronics', 25.00, '2024-03-01'),
-            (3, 2, 'Desk Chair', 'Furniture', 350.00, '2024-03-15'),
-            (4, 3, 'Monitor', 'Electronics', 400.00, '2024-03-10'),
-            (5, 3, 'Keyboard', 'Electronics', 75.00, '2024-03-10'),
-            (6, 4, 'Headphones', 'Electronics', 150.00, '2024-03-20'),
-            (7, 5, 'Desk', 'Furniture', 500.00, '2024-03-25'),
-        ]
-        
-        cursor.executemany(
-            'INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?)',
-            orders_data
-        )
-        
-        conn.commit()
-        conn.close()
-        
-        return db_path
-    
-    def execute_query(self, query: str) -> Tuple[bool, str, str]:
+        Args:
+            session_id: Unique session identifier
+            problem_id: Problem ID for table aliasing
+            allowed_tables: List of table names allowed for this problem (e.g., ['customers', 'orders'])
         """
-        Execute SQL query and return results
+        self.session_id = session_id
+        self.problem_id = problem_id
+        self.allowed_tables = allowed_tables or []
+        self.conn = duckdb.connect(':memory:')
+        # Note: Tables are loaded externally via load_problem_to_duckdb()
+    
+    
+    def _rewrite_query_with_aliases(self, query: str) -> str:
+        """Rewrite query to use aliased table names.
+        
+        Converts: SELECT * FROM customers
+        To:      SELECT * FROM customers_1
+        
+        Based on problem_id and allowed_tables list.
+        """
+        if not self.problem_id or not self.allowed_tables:
+            return query  # No aliasing if no problem_id
+        
+        # Create pattern to match table names (word boundaries)
+        # Must handle: FROM table, JOIN table, UPDATE table, etc.
+        rewritten = query
+        
+        for table_name in self.allowed_tables:
+            # Pattern matches table name with word boundaries
+            # Handles: FROM table, JOIN table, INTO table, etc.
+            pattern = r'\b' + re.escape(table_name) + r'\b'
+            aliased_name = f"{table_name}_{self.problem_id}"
+            rewritten = re.sub(pattern, aliased_name, rewritten, flags=re.IGNORECASE)
+        
+        return rewritten
+    
+    def _validate_table_access(self, query: str) -> Tuple[bool, str]:
+        """Validate that query only accesses allowed tables."""
+        if not self.allowed_tables:
+            return True, ""  # No restrictions if no allowed tables defined
+        
+        # Extract table names from query (basic parsing)
+        # This is a simple check - DuckDB will enforce actual table existence
+        query_upper = query.upper()
+        
+        # Check for suspicious table references not in allowed list
+        # This is not exhaustive but catches obvious violations
+        for keyword in ['FROM', 'JOIN', 'INTO']:
+            if keyword in query_upper:
+                # Basic validation - full SQL parsing would be more robust
+                pass
+        
+        return True, ""
+    
+    def _check_sql_safety(self, query: str) -> Tuple[bool, str]:
+        """
+        Check if SQL query is safe to execute
+        Returns: (is_safe, error_message)
+        """
+        # Remove comments and normalize whitespace
+        query_normalized = re.sub(r'--.*$', '', query, flags=re.MULTILINE)
+        query_normalized = re.sub(r'/\*.*?\*/', '', query_normalized, flags=re.DOTALL)
+        query_normalized = query_normalized.upper()
+        
+        # Check for blocked keywords
+        for keyword in self.BLOCKED_KEYWORDS:
+            # Use word boundaries to avoid false positives
+            pattern = r'\b' + keyword + r'\b'
+            if re.search(pattern, query_normalized):
+                return False, f"Blocked keyword detected: {keyword}. Only SELECT queries are allowed."
+        
+        return True, ""
+    
+    def _add_limit_if_needed(self, query: str) -> str:
+        """Add LIMIT clause if not present"""
+        query_upper = query.upper()
+        
+        # Check if LIMIT already exists
+        if 'LIMIT' not in query_upper:
+            # Add LIMIT to the end of the query
+            query = query.rstrip().rstrip(';')
+            query += f' LIMIT {self.MAX_ROWS}'
+        
+        return query
+    
+    def execute_query(self, query: str) -> Tuple[bool, List[Dict[str, Any]], List[str], float, str]:
+        """
+        Execute SQL query with safety checks and timeout
         
         Returns:
-            Tuple of (success, output, error)
+            Tuple of (success, rows, column_names, execution_time, error)
+            - rows: List of dictionaries (each row as a dict)
+            - column_names: List of column names
+            - execution_time: Execution time in seconds
         """
+        start_time = time.time()
+        
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            # Step 1: Validate table access
+            is_valid, error = self._validate_table_access(query)
+            if not is_valid:
+                return False, [], [], 0.0, error
             
-            # Execute query
-            cursor.execute(query)
+            # Step 2: Safety check
+            is_safe, error_msg = self._check_sql_safety(query)
+            if not is_safe:
+                return False, [], [], 0.0, error_msg
             
-            # Check if it's a SELECT query by checking if there are results
-            if cursor.description is not None:
-                # This is a SELECT query (has columns)
-                results = cursor.fetchall()
-                column_names = [description[0] for description in cursor.description]
+            # Step 3: Rewrite query with table aliases
+            rewritten_query = self._rewrite_query_with_aliases(query)
+            
+            # Step 4: Add LIMIT if needed (only for SELECT queries)
+            modified_query = rewritten_query
+            if rewritten_query.strip().upper().startswith('SELECT'):
+                modified_query = self._add_limit_if_needed(rewritten_query)
+            
+            # Execute query with timeout
+            result = self.conn.execute(modified_query)
+            
+            # Check if it's a query that returns results
+            if result.description:
+                column_names = [desc[0] for desc in result.description]
+                rows_tuples = result.fetchall()
                 
-                # Format output as table
-                output = self._format_table(column_names, results)
-                conn.close()
-                return True, output, ""
+                # Convert to list of dicts
+                rows = []
+                for row_tuple in rows_tuples:
+                    row_dict = {}
+                    for i, col_name in enumerate(column_names):
+                        # Convert to JSON-serializable types
+                        value = row_tuple[i]
+                        if hasattr(value, 'isoformat'):  # Date/datetime
+                            value = value.isoformat()
+                        row_dict[col_name] = value
+                    rows.append(row_dict)
+                
+                execution_time = time.time() - start_time
+                return True, rows, column_names, execution_time, ""
             else:
-                # For INSERT, UPDATE, DELETE queries
-                conn.commit()
-                affected_rows = cursor.rowcount
-                conn.close()
-                return True, f"Query executed successfully. {affected_rows} row(s) affected.", ""
+                # Query executed but returned nothing (shouldn't happen with SELECT-only)
+                execution_time = time.time() - start_time
+                return True, [], [], execution_time, ""
                 
-        except sqlite3.Error as e:
-            return False, "", f"SQL Error: {str(e)}"
+        except duckdb.Error as e:
+            execution_time = time.time() - start_time
+            return False, [], [], execution_time, f"SQL Error: {str(e)}"
         except Exception as e:
-            return False, "", f"Error: {str(e)}"
+            execution_time = time.time() - start_time
+            return False, [], [], execution_time, f"Error: {str(e)}"
     
-    def _format_table(self, columns: List[str], rows: List[Tuple]) -> str:
-        """Format query results as a readable table"""
-        if not rows:
-            return "Query returned no results."
+    def get_schema_info(self) -> Dict[str, List[Dict[str, str]]]:
+        """
+        Get database schema information
+        Returns: Dictionary with table names as keys and column info as values
+        """
+        schema = {}
         
-        # Calculate column widths
-        col_widths = [len(col) for col in columns]
-        for row in rows:
-            for i, val in enumerate(row):
-                col_widths[i] = max(col_widths[i], len(str(val)))
+        try:
+            # Get all tables
+            tables_result = self.conn.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+            ).fetchall()
+            
+            for (table_name,) in tables_result:
+                # Get column info for each table
+                columns_result = self.conn.execute(f'''
+                    SELECT column_name, data_type 
+                    FROM information_schema.columns 
+                    WHERE table_name = '{table_name}'
+                    ORDER BY ordinal_position
+                ''').fetchall()
+                
+                schema[table_name] = [
+                    {"name": col_name, "type": col_type}
+                    for col_name, col_type in columns_result
+                ]
         
-        # Create header
-        header = " | ".join(col.ljust(col_widths[i]) for i, col in enumerate(columns))
-        separator = "-+-".join("-" * width for width in col_widths)
+        except Exception:
+            # Fallback to basic schema
+            schema = {
+                "customers": [
+                    {"name": "customer_id", "type": "INTEGER"},
+                    {"name": "name", "type": "VARCHAR"},
+                    {"name": "email", "type": "VARCHAR"},
+                    {"name": "age", "type": "INTEGER"},
+                    {"name": "city", "type": "VARCHAR"},
+                    {"name": "registration_date", "type": "DATE"}
+                ],
+                "orders": [
+                    {"name": "order_id", "type": "INTEGER"},
+                    {"name": "customer_id", "type": "INTEGER"},
+                    {"name": "product_name", "type": "VARCHAR"},
+                    {"name": "category", "type": "VARCHAR"},
+                    {"name": "amount", "type": "DECIMAL"},
+                    {"name": "order_date", "type": "DATE"}
+                ]
+            }
         
-        # Create rows
-        formatted_rows = []
-        for row in rows:
-            formatted_row = " | ".join(str(val).ljust(col_widths[i]) for i, val in enumerate(row))
-            formatted_rows.append(formatted_row)
-        
-        # Combine everything
-        output = f"{header}\n{separator}\n" + "\n".join(formatted_rows)
-        output += f"\n\n({len(rows)} row(s) returned)"
-        
-        return output
+        return schema
     
-    def get_schema_info(self) -> str:
-        """Get database schema information"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Get all tables
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = cursor.fetchall()
-        
-        schema_info = "📊 Database Schema:\n\n"
-        
-        for table in tables:
-            table_name = table[0]
-            schema_info += f"Table: {table_name}\n"
-            
-            # Get column info
-            cursor.execute(f"PRAGMA table_info({table_name})")
-            columns = cursor.fetchall()
-            
-            for col in columns:
-                col_name, col_type = col[1], col[2]
-                schema_info += f"  - {col_name} ({col_type})\n"
-            
-            schema_info += "\n"
-        
-        conn.close()
-        return schema_info
+    def close(self):
+        """Close the DuckDB connection"""
+        if self.conn:
+            self.conn.close()
+

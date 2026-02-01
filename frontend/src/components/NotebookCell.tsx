@@ -1,5 +1,7 @@
 import React, { useRef } from 'react';
 import Editor from '@monaco-editor/react';
+import ResultTable from './ResultTable';
+import ChartBuilder from './ChartBuilder';
 
 interface NotebookCellProps {
   code: string;
@@ -11,6 +13,8 @@ interface NotebookCellProps {
   onExecute: () => void;
   onDelete: () => void;
   canDelete: boolean;
+  rows?: Array<Record<string, any>>;
+  columnNames?: string[];
 }
 
 const NotebookCell: React.FC<NotebookCellProps> = ({
@@ -22,9 +26,12 @@ const NotebookCell: React.FC<NotebookCellProps> = ({
   onCodeChange,
   onExecute,
   onDelete,
-  canDelete
+  canDelete,
+  rows,
+  columnNames,
 }) => {
   const editorRef = useRef<any>(null);
+  const [showChartBuilder, setShowChartBuilder] = React.useState(false);
 
   const handleEditorMount = (editor: any) => {
     editorRef.current = editor;
@@ -138,7 +145,7 @@ const NotebookCell: React.FC<NotebookCellProps> = ({
       </div>
 
       {/* Output Area */}
-      {(output || error) && (
+      {(output || error || (rows && rows.length > 0)) && (
         <div style={{
           padding: '12px',
           background: '#252526',
@@ -146,6 +153,39 @@ const NotebookCell: React.FC<NotebookCellProps> = ({
           fontFamily: 'monospace',
           fontSize: '12px',
         }}>
+          {/* SQL Results with Table */}
+          {language === 'sql' && rows && rows.length > 0 && columnNames && (
+            <>
+              <ResultTable rows={rows} columnNames={columnNames} />
+              <div style={{ marginTop: '12px' }}>
+                {!showChartBuilder ? (
+                  <button
+                    onClick={() => setShowChartBuilder(true)}
+                    style={{
+                      padding: '6px 12px',
+                      background: '#10B981',
+                      border: 'none',
+                      borderRadius: '4px',
+                      color: 'white',
+                      cursor: 'pointer',
+                      fontSize: '12px',
+                      fontWeight: 500,
+                    }}
+                  >
+                    📊 Create Chart
+                  </button>
+                ) : (
+                  <ChartBuilder
+                    rows={rows}
+                    columnNames={columnNames}
+                    onClose={() => setShowChartBuilder(false)}
+                  />
+                )}
+              </div>
+            </>
+          )}
+          
+          {/* Regular output */}
           {output && (
             <pre style={{
               margin: 0,
@@ -155,6 +195,8 @@ const NotebookCell: React.FC<NotebookCellProps> = ({
               {output}
             </pre>
           )}
+          
+          {/* Errors */}
           {error && (
             <pre style={{
               margin: 0,

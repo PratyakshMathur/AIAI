@@ -34,6 +34,7 @@ myenv/
 *.sqlite3
 ai_interview.db
 interview_sample.db
+*.csv
 
 # Environment variables
 .env

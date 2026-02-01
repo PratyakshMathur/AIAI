@@ -4,6 +4,7 @@ import AIChat from './AIChat';
 import NotebookContainer from './NotebookContainer';
 import { Session } from '../services/api';
 import { eventTracker } from '../services/eventTracker';
+import { apiService } from '../services/api';
 
 interface CandidateWorkspaceProps {
   session: Session;
@@ -32,13 +33,19 @@ print("Let's begin the data analysis!")
   );
   const [output, setOutput] = useState('');
   const [error, setError] = useState('');
-  const [language, setLanguage] = useState<'python' | 'sql'>('python');
+  const language = 'sql'; // Fixed to SQL only
   const [isRunning, setIsRunning] = useState(false);
   const [timeRemaining, setTimeRemaining] = useState(45 * 60); // 45 minutes
   const [leftPanelWidth, setLeftPanelWidth] = useState(25); // percentage
   const [rightPanelWidth, setRightPanelWidth] = useState(33); // percentage
   const [outputHeight, setOutputHeight] = useState(192); // pixels
   const [viewMode, setViewMode] = useState<'editor' | 'notebook'>('notebook'); // Default to notebook
+  const [showAIHelper, setShowAIHelper] = useState(true);
+  const [problemDescription, setProblemDescription] = useState<string>('');
+  const [loadingProblem, setLoadingProblem] = useState(true);
+  const [phase, setPhase] = useState(session.phase || 'coding');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [firstInterviewQuestion, setFirstInterviewQuestion] = useState<string | null>(null);
 
   // Timer effect
   useEffect(() => {
@@ -63,6 +70,26 @@ print("Let's begin the data analysis!")
       eventTracker.cleanup();
     };
   }, [session.session_id]);
+
+  // Fetch problem description if problem_id exists
+  useEffect(() => {
+    const fetchProblem = async () => {
+      if (session.problem_id) {
+        try {
+          const problem = await apiService.getProblem(session.problem_id);
+          setProblemDescription(problem.description);
+        } catch (error) {
+          console.error('Failed to fetch problem:', error);
+          setProblemDescription(session.problem_statement); // Fallback to session problem_statement
+        }
+      } else {
+        setProblemDescription(session.problem_statement);
+      }
+      setLoadingProblem(false);
+    };
+    
+    fetchProblem();
+  }, [session.problem_id, session.problem_statement]);
 
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
@@ -142,6 +169,40 @@ print("Let's begin the data analysis!")
     console.log('AI response used:', interactionId);
   };
 
+  const handleSubmit = async () => {
+    if (isSubmitting) return;
+    
+    setIsSubmitting(true);
+    eventTracker.trackPhaseSubmitted();
+    
+    try {
+      const response = await fetch(`http://localhost:8000/api/sessions/${session.session_id}/submit`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        }
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        setPhase(data.phase || 'interview');
+        eventTracker.trackInterviewStarted();
+        
+        // Store first interview question
+        if (data.first_question) {
+          setFirstInterviewQuestion(data.first_question);
+          console.log('Interview started with question:', data.first_question);
+        }
+      } else {
+        console.error('Failed to submit phase');
+      }
+    } catch (error) {
+      console.error('Error submitting phase:', error);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   return (
     <div className="h-screen bg-gray-100 flex flex-col">
       {/* Header */}
@@ -189,6 +250,22 @@ print("Let's begin the data analysis!")
               <div className="text-xs text-gray-500">Time Remaining</div>
             </div>
             
+            {phase === 'coding' && (
+              <button
+                onClick={handleSubmit}
+                disabled={isSubmitting}
+                className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isSubmitting ? 'Submitting...' : '✓ Submit & Start Interview'}
+              </button>
+            )}
+            
+            {phase === 'interview' && (
+              <div className="px-4 py-2 bg-blue-600 text-white rounded-md font-semibold">
+                📝 Interview Mode
+              </div>
+            )}
+            
             <button
               onClick={onEndSession}
               className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors"
@@ -203,25 +280,32 @@ print("Let's begin the data analysis!")
       <div className="flex-1 flex overflow-hidden">
         {/* Left Panel - Problem Statement */}
         <div 
-          className="bg-gray-800 border-r flex flex-col"
+          className="bg-white border-r flex flex-col"
           style={{ width: `${leftPanelWidth}%` }}
         >
-          <div className="p-4 border-b bg-gray-700">
-            <h2 className="text-lg font-semibold text-white">Problem Statement</h2>
+          <div className="p-4 border-b bg-gray-50">
+            <h2 className="text-lg font-semibold text-gray-800">Problem Statement</h2>
           </div>
           <div className="flex-1 overflow-y-auto p-4">
-            <div className="prose prose-sm max-w-none">
-              <div 
-                className="text-sm text-white leading-relaxed"
-                dangerouslySetInnerHTML={{
-                  __html: session.problem_statement
-                    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-                    .replace(/##\s+([^\n]+)/g, '<h3 class="text-lg font-bold text-blue-300 mt-4 mb-2">$1</h3>')
-                    .replace(/\n/g, '<br>')
-                    .replace(/-\s+([^\n]+)/g, '• $1')
-                }}
-              />
-            </div>
+            {loadingProblem ? (
+              <div className="text-gray-500 text-center py-8">Loading problem...</div>
+            ) : (
+              <div className="prose prose-sm max-w-none">
+                <div 
+                  className="text-sm text-gray-800 leading-relaxed"
+                  dangerouslySetInnerHTML={{
+                    __html: problemDescription
+                      .replace(/\*\*([^*]+)\*\*/g, '<strong class="font-semibold text-gray-900">$1</strong>')
+                      .replace(/###\s+([^\n]+)/g, '<h4 class="text-sm font-bold text-gray-900 mt-3 mb-1">$1</h4>')
+                      .replace(/##\s+([^\n]+)/g, '<h3 class="text-base font-bold text-gray-900 mt-4 mb-2">$1</h3>')
+                      .replace(/#\s+([^\n]+)/g, '<h2 class="text-lg font-bold text-gray-900 mt-5 mb-3">$1</h2>')
+                      .replace(/\n/g, '<br>')
+                      .replace(/-\s+([^\n]+)/g, '<div class="ml-4 mb-1">• $1</div>')
+                      .replace(/`([^`]+)`/g, '<code class="bg-gray-100 px-1 py-0.5 rounded text-xs font-mono">$1</code>')
+                  }}
+                />
+              </div>
+            )}
           </div>
         </div>
 
@@ -248,7 +332,7 @@ print("Let's begin the data analysis!")
         {/* Center Panel - Code Editor + Terminal OR Notebook */}
         <div 
           className="flex flex-col"
-          style={{ width: `${100 - leftPanelWidth - rightPanelWidth}%` }}
+          style={{ width: `${100 - leftPanelWidth - (showAIHelper ? rightPanelWidth : 0)}%` }}
         >
           {viewMode === 'editor' ? (
             <>
@@ -326,52 +410,83 @@ print("Let's begin the data analysis!")
           ) : (
             /* Notebook View */
             <NotebookContainer 
-              language={language}
-              onLanguageChange={setLanguage}
               sessionId={session.session_id}
             />
           )}
         </div>
 
-        {/* Resize Handle - Right */}
-        <div 
-          className="w-1 bg-gray-400 cursor-col-resize hover:bg-blue-500 transition-colors"
-          onMouseDown={(e) => {
-            const startX = e.clientX;
-            const startWidth = rightPanelWidth;
-            const handleMouseMove = (e: MouseEvent) => {
-              const deltaX = e.clientX - startX;
-              const newWidth = Math.max(20, Math.min(50, startWidth - (deltaX / window.innerWidth) * 100));
-              setRightPanelWidth(newWidth);
-            };
-            const handleMouseUp = () => {
-              document.removeEventListener('mousemove', handleMouseMove);
-              document.removeEventListener('mouseup', handleMouseUp);
-            };
-            document.addEventListener('mousemove', handleMouseMove);
-            document.addEventListener('mouseup', handleMouseUp);
-          }}
-        />
-
         {/* Right Panel - AI Chat (Like VS Code sidebar) */}
-        <div 
-          className="bg-white border-l flex flex-col"
-          style={{ width: `${rightPanelWidth}%` }}
-        >
-          <div className="bg-gray-100 px-4 py-2 border-b flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-gray-800">💬 AI Assistant</h3>
-            <button className="text-gray-500 hover:text-gray-700 text-xs">✕</button>
-          </div>
-          <div className="flex-1 min-h-0">
-            <AIChat
-              sessionId={session.session_id}
-              codeContext={code}
-              errorContext={error}
-              onResponseUsed={handleAIResponseUsed}
+        {showAIHelper && (
+          <>
+            {/* Resize Handle - Right */}
+            <div 
+              className="w-1 bg-gray-400 cursor-col-resize hover:bg-blue-500 transition-colors"
+              onMouseDown={(e) => {
+                const startX = e.clientX;
+                const startWidth = rightPanelWidth;
+                const handleMouseMove = (e: MouseEvent) => {
+                  const deltaX = e.clientX - startX;
+                  const newWidth = Math.max(20, Math.min(50, startWidth - (deltaX / window.innerWidth) * 100));
+                  setRightPanelWidth(newWidth);
+                };
+                const handleMouseUp = () => {
+                  document.removeEventListener('mousemove', handleMouseMove);
+                  document.removeEventListener('mouseup', handleMouseUp);
+                };
+                document.addEventListener('mousemove', handleMouseMove);
+                document.addEventListener('mouseup', handleMouseUp);
+              }}
             />
-          </div>
-        </div>
+
+            <div 
+              className="bg-white border-l flex flex-col"
+              style={{ width: `${rightPanelWidth}%` }}
+            >
+              <div className="bg-gray-100 px-4 py-2 border-b flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-gray-800">💬 AI Assistant</h3>
+                <button 
+                  onClick={() => setShowAIHelper(false)}
+                  className="text-gray-500 hover:text-gray-700 text-xs"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="flex-1 min-h-0">
+                <AIChat
+                  sessionId={session.session_id}
+                  codeContext={code}
+                  errorContext={error}
+                  onResponseUsed={handleAIResponseUsed}
+                  mode={phase === 'interview' ? 'interview' : 'coding'}
+                  initialQuestion={firstInterviewQuestion}
+                />
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* Toggle AI Helper Button when hidden */}
+        {!showAIHelper && (
+          <button
+            onClick={() => setShowAIHelper(true)}
+            className="fixed right-4 top-24 bg-blue-600 text-white px-3 py-2 rounded-l-lg shadow-lg hover:bg-blue-700 transition-colors z-50"
+            title="Show AI Assistant"
+          >
+            💬
+          </button>
+        )}
       </div>
+
+      {/* Toggle AI Helper Button when hidden */}
+      {!showAIHelper && (
+        <button
+          onClick={() => setShowAIHelper(true)}
+          className="fixed right-4 top-24 bg-blue-600 text-white px-3 py-2 rounded-l-lg shadow-lg hover:bg-blue-700 transition-colors z-50"
+          title="Show AI Assistant"
+        >
+          💬
+        </button>
+      )}
 
       {/* Event Indicator */}
       <div className="event-indicator">

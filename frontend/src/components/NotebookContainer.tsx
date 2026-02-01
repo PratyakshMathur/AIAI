@@ -10,22 +10,20 @@ interface Cell {
   output: string;
   error: string;
   executionCount: number | null;
+  rows?: Array<Record<string, any>>;
+  columnNames?: string[];
 }
 
 interface NotebookContainerProps {
-  language: 'python' | 'sql';
-  onLanguageChange: (language: 'python' | 'sql') => void;
   sessionId: string;
 }
 
-const NotebookContainer: React.FC<NotebookContainerProps> = ({ language, onLanguageChange, sessionId }) => {
+const NotebookContainer: React.FC<NotebookContainerProps> = ({ sessionId }) => {
   const [cells, setCells] = useState<Cell[]>([
     {
       id: '1',
-      code: language === 'python' 
-        ? '# Load sample data\nimport pandas as pd\nimport io\n\n# Sample customer data\ncustomers_data = """customer_id,name,email,age,city,registration_date\n1,Alice Johnson,alice@email.com,28,New York,2024-01-15\n2,Bob Smith,bob@email.com,34,Los Angeles,2024-02-20\n3,Carol White,carol@email.com,45,Chicago,2024-01-10\n4,David Brown,david@email.com,29,Houston,2024-03-05\n5,Eve Davis,eve@email.com,52,Phoenix,2024-02-28"""\n\ncustomers = pd.read_csv(io.StringIO(customers_data))\n\n# Sample orders data\norders_data = """order_id,customer_id,product_name,category,amount,order_date\n1,1,Laptop,Electronics,1200.00,2024-03-01\n2,1,Mouse,Electronics,25.00,2024-03-01\n3,2,Desk Chair,Furniture,350.00,2024-03-15\n4,3,Monitor,Electronics,400.00,2024-03-10\n5,3,Keyboard,Electronics,75.00,2024-03-10\n6,4,Headphones,Electronics,150.00,2024-03-20\n7,5,Desk,Furniture,500.00,2024-03-25"""\n\norders = pd.read_csv(io.StringIO(orders_data))\n\nprint("📊 Data loaded successfully!")\nprint(f"Customers: {len(customers)} rows, {len(customers.columns)} columns")\nprint(f"Orders: {len(orders)} rows, {len(orders.columns)} columns")'
-        : '-- Write your SQL query here\nSELECT * FROM customers LIMIT 5;',
-      language,
+      code: '-- Write your SQL query here\nSELECT * FROM customers LIMIT 5;',
+      language: 'sql',
       output: '',
       error: '',
       executionCount: null,
@@ -43,15 +41,12 @@ const NotebookContainer: React.FC<NotebookContainerProps> = ({ language, onLangu
     };
   }, [sessionId]);
 
-  // Fetch schema info when switching to SQL
+  // Fetch schema info on mount
   React.useEffect(() => {
-    if (language === 'sql' && !schemaInfo) {
+    if (!schemaInfo) {
       fetchSchema();
     }
-    if (language === 'python' && !dataInfo) {
-      fetchDataInfo();
-    }
-  }, [language]);
+  }, []);
 
   const fetchSchema = async () => {
     try {
@@ -81,33 +76,11 @@ const NotebookContainer: React.FC<NotebookContainerProps> = ({ language, onLangu
     setDataInfo(info);
   };
 
-  const handleLanguageToggle = () => {
-    const newLanguage = language === 'python' ? 'sql' : 'python';
-    onLanguageChange(newLanguage);
-    
-    // Update ALL cells to the new language - no mixing allowed
-    setCells(prevCells => prevCells.map((cell, index) => ({
-      ...cell,
-      language: newLanguage,
-      // Only reset code for the first cell to have starter template
-      code: index === 0 
-        ? (newLanguage === 'python' 
-          ? '# Load sample data\nimport pandas as pd\nimport io\n\n# Sample customer data\ncustomers_data = """customer_id,name,email,age,city,registration_date\n1,Alice Johnson,alice@email.com,28,New York,2024-01-15\n2,Bob Smith,bob@email.com,34,Los Angeles,2024-02-20\n3,Carol White,carol@email.com,45,Chicago,2024-01-10\n4,David Brown,david@email.com,29,Houston,2024-03-05\n5,Eve Davis,eve@email.com,52,Phoenix,2024-02-28"""\n\ncustomers = pd.read_csv(io.StringIO(customers_data))\n\n# Sample orders data\norders_data = """order_id,customer_id,product_name,category,amount,order_date\n1,1,Laptop,Electronics,1200.00,2024-03-01\n2,1,Mouse,Electronics,25.00,2024-03-01\n3,2,Desk Chair,Furniture,350.00,2024-03-15\n4,3,Monitor,Electronics,400.00,2024-03-10\n5,3,Keyboard,Electronics,75.00,2024-03-10\n6,4,Headphones,Electronics,150.00,2024-03-20\n7,5,Desk,Furniture,500.00,2024-03-25"""\n\norders = pd.read_csv(io.StringIO(orders_data))\n\nprint("📊 Data loaded successfully!")\nprint(f"Customers: {len(customers)} rows, {len(customers.columns)} columns")\nprint(f"Orders: {len(orders)} rows, {len(orders.columns)} columns")'
-          : '-- Write your SQL query here\nSELECT * FROM customers LIMIT 5;')
-        : cell.code,  // Keep existing code for other cells
-      output: '',
-      error: '',
-      executionCount: null,
-    })));
-  };
-
   const addCell = (afterId?: string) => {
     const newCell: Cell = {
       id: Date.now().toString(),
-      code: language === 'python' 
-        ? '# Python code\nimport pandas as pd\n\n' 
-        : '-- SQL query\nSELECT * FROM customers LIMIT 5;',
-      language,  // Use current global language for new cells
+      code: '-- SQL query',
+      language: 'sql',
       output: '',
       error: '',
       executionCount: null,
@@ -152,7 +125,7 @@ const NotebookContainer: React.FC<NotebookContainerProps> = ({ language, onLangu
     // Update cell with execution count and clear previous output
     setCells(cells.map(c => 
       c.id === id 
-        ? { ...c, executionCount, output: 'Executing...', error: '' } 
+        ? { ...c, executionCount, output: 'Executing...', error: '', rows: undefined, columnNames: undefined } 
         : c
     ));
 
@@ -164,19 +137,44 @@ const NotebookContainer: React.FC<NotebookContainerProps> = ({ language, onLangu
 
       const response = await axios.post(endpoint, {
         code: cell.code,
-        language: cell.language,  // Use cell's language
+        language: cell.language,
+        session_id: sessionId,  // Pass session_id for event logging
       });
 
-      setCells(cells.map(c =>
-        c.id === id
-          ? {
-              ...c,
-              output: response.data.output,
-              error: response.data.error,
-              executionCount,
-            }
-          : c
-      ));
+      // Track SQL complexity after execution
+      if (cell.language === 'sql') {
+        eventTracker.trackSQLComplexity(cell.code);
+      }
+
+      // For SQL, store rows and column_names from response
+      if (cell.language === 'sql' && response.data.rows) {
+        setCells(cells.map(c =>
+          c.id === id
+            ? {
+                ...c,
+                output: response.data.output,
+                error: response.data.error,
+                executionCount,
+                rows: response.data.rows,
+                columnNames: response.data.column_names,
+              }
+            : c
+        ));
+      } else {
+        // Python or SQL with no results
+        setCells(cells.map(c =>
+          c.id === id
+            ? {
+                ...c,
+                output: response.data.output,
+                error: response.data.error,
+                executionCount,
+                rows: undefined,
+                columnNames: undefined,
+              }
+            : c
+        ));
+      }
       
       // Track successful execution
       eventTracker.trackRunResult(true, response.data.output);
@@ -189,6 +187,8 @@ const NotebookContainer: React.FC<NotebookContainerProps> = ({ language, onLangu
               output: '',
               error: errorMessage,
               executionCount,
+              rows: undefined,
+              columnNames: undefined,
             }
           : c
       ));
@@ -212,42 +212,15 @@ const NotebookContainer: React.FC<NotebookContainerProps> = ({ language, onLangu
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
           <span style={{ color: '#cccccc', fontSize: '14px', fontWeight: 500 }}>
-            📓 Notebook
+            �️ SQL Notebook
           </span>
-          
-          {/* Language Toggle */}
-          <div style={{ display: 'flex', background: '#1e1e1e', borderRadius: '4px', overflow: 'hidden' }}>
-            <button
-              onClick={handleLanguageToggle}
-              style={{
-                padding: '4px 12px',
-                background: language === 'python' ? '#0e639c' : 'transparent',
-                border: 'none',
-                color: '#cccccc',
-                cursor: 'pointer',
-                fontSize: '13px',
-              }}
-            >
-              🐍 Python
-            </button>
-            <button
-              onClick={handleLanguageToggle}
-              style={{
-                padding: '4px 12px',
-                background: language === 'sql' ? '#0e639c' : 'transparent',
-                border: 'none',
-                color: '#cccccc',
-                cursor: 'pointer',
-                fontSize: '13px',
-              }}
-            >
-              🗄️ SQL
-            </button>
-          </div>
 
-          {language === 'sql' && schemaInfo && (
+          {schemaInfo && (
             <button
-              onClick={() => alert(schemaInfo)}
+              onClick={() => {
+                eventTracker.trackSchemaExplored('database_schema');
+                alert(schemaInfo);
+              }}
               style={{
                 padding: '4px 12px',
                 background: '#3e3e42',
@@ -260,24 +233,6 @@ const NotebookContainer: React.FC<NotebookContainerProps> = ({ language, onLangu
               title="View database schema"
             >
               📊 Schema
-            </button>
-          )}
-
-          {language === 'python' && dataInfo && (
-            <button
-              onClick={() => alert(dataInfo)}
-              style={{
-                padding: '4px 12px',
-                background: '#3e3e42',
-                border: '1px solid #454545',
-                borderRadius: '4px',
-                color: '#cccccc',
-                cursor: 'pointer',
-                fontSize: '12px',
-              }}
-              title="View data information"
-            >
-              📊 Data Info
             </button>
           )}
         </div>
@@ -316,6 +271,8 @@ const NotebookContainer: React.FC<NotebookContainerProps> = ({ language, onLangu
               onExecute={() => executeCell(cell.id)}
               onDelete={() => deleteCell(cell.id)}
               canDelete={cells.length > 1}
+              rows={cell.rows}
+              columnNames={cell.columnNames}
             />
             <div style={{
               display: 'flex',

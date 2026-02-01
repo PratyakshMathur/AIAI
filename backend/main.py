@@ -4,9 +4,15 @@ from sqlalchemy.orm import Session
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import json
-import uuid
 import logging
 import sys
+import sqlite3
+from pathlib import Path
+from dotenv import load_dotenv
+import os
+
+# Load environment variables from .env file
+load_dotenv()
 
 from database import get_db, init_database
 from models import Session as SessionModel, Event, AIInteraction, Feature
@@ -14,6 +20,10 @@ from pydantic import BaseModel
 from ai_helper import AIHelper
 from event_processor import EventProcessor
 from code_executor import CodeExecutor
+from sql_executor import SQLExecutor
+from problem_manager.data_loader import load_problem_to_duckdb, get_problem_table_names
+from langchain_config import init_ai_engine
+from ai_analyzer import get_analyzer
 
 # Configure enhanced logging
 logging.basicConfig(
@@ -56,21 +66,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize components
+# Initialize AI engine FIRST (before AIHelper)
+import os
+gemini_key = os.getenv("GEMINI_API_KEY")
+if gemini_key:
+    init_ai_engine(gemini_api_key=gemini_key)
+    logger.info("✅ AI Engine initialized with Gemini")
+else:
+    logger.warning("⚠️  GEMINI_API_KEY not set - AI features may be limited")
+
+# Initialize components (AIHelper needs AI engine to be ready)
 ai_helper = AIHelper()
 event_processor = EventProcessor()
-
-# Import code executor
-from code_executor import CodeExecutor
-from sql_executor import SQLExecutor
 code_executor = CodeExecutor(timeout=30)
-sql_executor = SQLExecutor()
+# Session-specific SQL executors
+sql_executors: Dict[str, SQLExecutor] = {}
 
 # Pydantic models for request/response
 class SessionCreate(BaseModel):
     candidate_name: str
     interviewer_name: Optional[str] = None
-    problem_statement: str
+    problem_statement: str  # Can be empty if problem_id is provided
+    problem_id: Optional[int] = None  # NEW: Reference to problem in problems.db
     session_data: Optional[Dict[str, Any]] = {}
 
 class EventCreate(BaseModel):
@@ -86,20 +103,29 @@ class AIPromptRequest(BaseModel):
 class CodeExecutionRequest(BaseModel):
     code: str
     language: str = "python"
+    session_id: Optional[str] = None
 
 class CodeExecutionResponse(BaseModel):
     success: bool
     output: str
     error: str
+    rows: Optional[List[Dict[str, Any]]] = None
+    column_names: Optional[List[str]] = None
+    execution_time: Optional[float] = None
+    row_count: Optional[int] = None
 
 class SessionResponse(BaseModel):
     session_id: str
     candidate_name: str
     interviewer_name: Optional[str]
     problem_statement: str
+    problem_id: Optional[int]
     start_time: datetime
     end_time: Optional[datetime]
     status: str
+    phase: Optional[str] = "coding"  # NEW
+    submitted_at: Optional[datetime] = None  # NEW
+    ai_insights: Optional[Dict[str, Any]] = None  # NEW
     
 class EventResponse(BaseModel):
     event_id: str
@@ -141,6 +167,106 @@ try:
 except Exception as e:
     print(f"Database initialization error: {e}")
 
+# Problem API endpoints
+PROBLEMS_DB_PATH = Path(__file__).parent / "problems.db"
+
+def get_problems_db():
+    """Get connection to problems database"""
+    if not PROBLEMS_DB_PATH.exists():
+        raise HTTPException(status_code=500, detail="Problems database not found. Run problem_manager/init_db.py")
+    return sqlite3.connect(PROBLEMS_DB_PATH)
+
+@app.get("/api/problems")
+async def get_all_problems():
+    """Get all available interview problems"""
+    try:
+        conn = get_problems_db()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT p.id, p.title, p.description, p.difficulty, p.created_at,
+                   COUNT(DISTINCT pt.table_name) as table_count
+            FROM problems p
+            LEFT JOIN problem_tables pt ON p.id = pt.problem_id
+            GROUP BY p.id
+            ORDER BY p.id
+        """)
+        
+        problems = []
+        for row in cursor.fetchall():
+            problems.append({
+                "id": row[0],
+                "title": row[1],
+                "description": row[2],
+                "difficulty": row[3],
+                "created_at": row[4],
+                "table_count": row[5]
+            })
+        
+        conn.close()
+        return problems
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching problems: {str(e)}")
+
+@app.get("/api/problems/{problem_id}")
+async def get_problem(problem_id: int):
+    """Get specific problem with table details"""
+    try:
+        conn = get_problems_db()
+        cursor = conn.cursor()
+        
+        # Get problem details
+        cursor.execute("""
+            SELECT id, title, description, difficulty, created_at
+            FROM problems
+            WHERE id = ?
+        """, (problem_id,))
+        
+        problem_row = cursor.fetchone()
+        if not problem_row:
+            raise HTTPException(status_code=404, detail=f"Problem {problem_id} not found")
+        
+        # Get table details
+        cursor.execute("""
+            SELECT table_name, schema_json
+            FROM problem_tables
+            WHERE problem_id = ?
+            ORDER BY table_name
+        """, (problem_id,))
+        
+        tables = []
+        for table_name, schema_json in cursor.fetchall():
+            schema = json.loads(schema_json)
+            
+            # Count rows
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM table_data
+                WHERE problem_id = ? AND table_name = ?
+            """, (problem_id, table_name))
+            row_count = cursor.fetchone()[0]
+            
+            tables.append({
+                "name": table_name,
+                "schema": schema,
+                "row_count": row_count
+            })
+        
+        conn.close()
+        
+        return {
+            "id": problem_row[0],
+            "title": problem_row[1],
+            "description": problem_row[2],
+            "difficulty": problem_row[3],
+            "created_at": problem_row[4],
+            "tables": tables
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching problem: {str(e)}")
+
 # Session endpoints
 @app.get("/api/sessions")
 async def get_all_sessions(db: Session = Depends(get_db)):
@@ -152,9 +278,13 @@ async def get_all_sessions(db: Session = Depends(get_db)):
             "candidate_name": s.candidate_name,
             "interviewer_name": s.interviewer_name,
             "problem_statement": s.problem_statement,
+            "problem_id": s.problem_id,
             "start_time": s.start_time.isoformat(),
             "end_time": s.end_time.isoformat() if s.end_time else None,
-            "status": s.status
+            "status": s.status,
+            "phase": s.phase,
+            "submitted_at": s.submitted_at.isoformat() if s.submitted_at else None,
+            "ai_insights": s.ai_insights
         } for s in sessions]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching sessions: {str(e)}")
@@ -163,10 +293,28 @@ async def get_all_sessions(db: Session = Depends(get_db)):
 async def create_session(session_data: SessionCreate, db: Session = Depends(get_db)):
     """Create a new interview session"""
     try:
+        # If problem_id provided, fetch problem details from problems.db
+        problem_statement = session_data.problem_statement
+        problem_id = session_data.problem_id
+        
+        if problem_id:
+            conn = get_problems_db()
+            cursor = conn.cursor()
+            cursor.execute("SELECT title, description FROM problems WHERE id = ?", (problem_id,))
+            problem = cursor.fetchone()
+            conn.close()
+            
+            if not problem:
+                raise HTTPException(status_code=404, detail=f"Problem {problem_id} not found")
+            
+            # Use problem description as problem_statement
+            problem_statement = problem[1]  # description
+        
         new_session = SessionModel(
             candidate_name=session_data.candidate_name,
             interviewer_name=session_data.interviewer_name,
-            problem_statement=session_data.problem_statement,
+            problem_statement=problem_statement,
+            problem_id=problem_id,
             session_data=session_data.session_data
         )
         db.add(new_session)
@@ -177,7 +325,7 @@ async def create_session(session_data: SessionCreate, db: Session = Depends(get_
         start_event = Event(
             session_id=new_session.session_id,
             event_type="SESSION_START",
-            event_metadata={"candidate_name": session_data.candidate_name},
+            event_metadata={"candidate_name": session_data.candidate_name, "problem_id": problem_id},
             sequence_number=1
         )
         db.add(start_event)
@@ -188,6 +336,7 @@ async def create_session(session_data: SessionCreate, db: Session = Depends(get_
             candidate_name=new_session.candidate_name,
             interviewer_name=new_session.interviewer_name,
             problem_statement=new_session.problem_statement,
+            problem_id=new_session.problem_id,
             start_time=new_session.start_time,
             end_time=new_session.end_time,
             status=new_session.status
@@ -232,9 +381,13 @@ async def get_session(session_id: str, db: Session = Depends(get_db)):
         candidate_name=session.candidate_name,
         interviewer_name=session.interviewer_name,
         problem_statement=session.problem_statement,
+        problem_id=session.problem_id,
         start_time=session.start_time,
         end_time=session.end_time,
-        status=session.status
+        status=session.status,
+        phase=session.phase,
+        submitted_at=session.submitted_at,
+        ai_insights=session.ai_insights
     )
 
 @app.post("/api/sessions/{session_id}/complete")
@@ -318,10 +471,15 @@ async def get_session_events(session_id: str, db: Session = Depends(get_db)):
 async def ai_prompt(request: AIPromptRequest, db: Session = Depends(get_db)):
     """Send prompt to AI assistant"""
     try:
-        # Get AI response
+        # Get mode from context_data (default to 'coding')
+        mode = request.context_data.get('mode', 'coding') if request.context_data else 'coding'
+        
+        # Get AI response with mode support
         ai_response = await ai_helper.process_prompt(
             request.user_prompt, 
-            request.context_data
+            request.context_data,
+            request.session_id,
+            mode=mode
         )
         
         # Classify intent
@@ -337,28 +495,61 @@ async def ai_prompt(request: AIPromptRequest, db: Session = Depends(get_db)):
         )
         db.add(interaction)
         
-        # Log AI_PROMPT and AI_RESPONSE events
-        prompt_event = Event(
-            session_id=request.session_id,
-            event_type="AI_PROMPT",
-            event_metadata={
-                "prompt": request.user_prompt,
-                "intent": intent,
-                "interaction_id": interaction.interaction_id
-            }
-        )
-        db.add(prompt_event)
+        # Get next sequence number
+        last_event = db.query(Event).filter(
+            Event.session_id == request.session_id
+        ).order_by(Event.sequence_number.desc()).first()
+        next_seq = (last_event.sequence_number + 1) if last_event else 1
         
-        response_event = Event(
-            session_id=request.session_id,
-            event_type="AI_RESPONSE", 
-            event_metadata={
-                "response": ai_response,
-                "intent": intent,
-                "interaction_id": interaction.interaction_id
-            }
-        )
-        db.add(response_event)
+        # Log appropriate events based on mode
+        if mode == 'interview':
+            # Interview mode events
+            prompt_event = Event(
+                session_id=request.session_id,
+                event_type="INTERVIEW_ANSWER",
+                event_metadata={
+                    "answer": request.user_prompt,
+                    "interaction_id": interaction.interaction_id
+                },
+                sequence_number=next_seq
+            )
+            db.add(prompt_event)
+            
+            response_event = Event(
+                session_id=request.session_id,
+                event_type="INTERVIEW_QUESTION", 
+                event_metadata={
+                    "question": ai_response,
+                    "interaction_id": interaction.interaction_id
+                },
+                sequence_number=next_seq + 1
+            )
+            db.add(response_event)
+        else:
+            # Coding mode events
+            prompt_event = Event(
+                session_id=request.session_id,
+                event_type="AI_PROMPT",
+                event_metadata={
+                    "prompt": request.user_prompt,
+                    "intent": intent,
+                    "interaction_id": interaction.interaction_id
+                },
+                sequence_number=next_seq
+            )
+            db.add(prompt_event)
+            
+            response_event = Event(
+                session_id=request.session_id,
+                event_type="AI_RESPONSE", 
+                event_metadata={
+                    "response": ai_response,
+                    "intent": intent,
+                    "interaction_id": interaction.interaction_id
+                },
+                sequence_number=next_seq + 1
+            )
+            db.add(response_event)
         
         db.commit()
         
@@ -370,6 +561,7 @@ async def ai_prompt(request: AIPromptRequest, db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error processing AI prompt: {str(e)}")
+
 
 @app.post("/api/ai/response-used")
 async def mark_response_used(interaction_id: str, db: Session = Depends(get_db)):
@@ -383,16 +575,131 @@ async def mark_response_used(interaction_id: str, db: Session = Depends(get_db))
     
     interaction.response_used = True
     
+    # Get next sequence number
+    last_event = db.query(Event).filter(
+        Event.session_id == interaction.session_id
+    ).order_by(Event.sequence_number.desc()).first()
+    next_seq = (last_event.sequence_number + 1) if last_event else 1
+    
     # Log usage event
     usage_event = Event(
         session_id=interaction.session_id,
         event_type="AI_RESPONSE_USED",
-        event_metadata={"interaction_id": interaction_id}
+        event_metadata={"interaction_id": interaction_id},
+        sequence_number=next_seq
     )
     db.add(usage_event)
     
     db.commit()
     return {"message": "Response marked as used"}
+
+# ===== NEW: Phase Submission & Interview Endpoints =====
+
+@app.post("/api/sessions/{session_id}/submit")
+async def submit_coding_phase(session_id: str, db: Session = Depends(get_db)):
+    """Submit coding phase and transition to interview mode"""
+    try:
+        # Get session
+        session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        if session.phase != "coding":
+            raise HTTPException(status_code=400, detail=f"Cannot submit from phase: {session.phase}")
+        
+        # Update session
+        session.phase = "interview"
+        session.submitted_at = datetime.utcnow()
+        
+        # Get next sequence number
+        last_event = db.query(Event).filter(
+            Event.session_id == session_id
+        ).order_by(Event.sequence_number.desc()).first()
+        next_seq = (last_event.sequence_number + 1) if last_event else 1
+        
+        # Log phase submission event
+        event = Event(
+            session_id=session_id,
+            event_type="PHASE_SUBMITTED",
+            event_metadata={"timestamp": datetime.utcnow().isoformat()},
+            sequence_number=next_seq
+        )
+        db.add(event)
+        
+        # Log interview started event
+        interview_event = Event(
+            session_id=session_id,
+            event_type="INTERVIEW_STARTED",
+            event_metadata={"timestamp": datetime.utcnow().isoformat()},
+            sequence_number=next_seq + 1
+        )
+        db.add(interview_event)
+        
+        db.commit()
+        
+        # Generate first interview question
+        query_events = db.query(Event).filter(
+            Event.session_id == session_id,
+            Event.event_type == "SQL_RUN"
+        ).all()
+        
+        query_history = [
+            e.event_metadata.get("query_text", "")
+            for e in query_events
+            if e.event_metadata
+        ]
+        
+        first_question = await ai_helper.generate_interview_question(
+            session_id=session_id,
+            query_history=query_history,
+            question_number=1
+        )
+        
+        # Log interview question
+        question_event = Event(
+            session_id=session_id,
+            event_type="INTERVIEW_QUESTION",
+            event_metadata={
+                "question": first_question,
+                "question_number": 1
+            },
+            sequence_number=next_seq + 2
+        )
+        db.add(question_event)
+        db.commit()
+        
+        return {
+            "phase": "interview",
+            "message": "Coding phase submitted successfully",
+            "first_question": first_question
+        }
+    
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Submit error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/sessions/{session_id}/analyze")
+async def analyze_session(session_id: str, db: Session = Depends(get_db)):
+    """Trigger AI analysis of session (for recruiter dashboard)"""
+    try:
+        session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Run analyzer AI
+        analyzer = get_analyzer()
+        insights = await analyzer.analyze_session(session_id, db)
+        
+        # Store insights in session
+        session.ai_insights = insights
+        db.commit()
+        
+        return insights
+    
+    except Exception as e:
+        logger.error(f"Analysis error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Features endpoint
 @app.get("/api/sessions/{session_id}/features")
@@ -412,28 +719,126 @@ async def get_session_features(session_id: str, db: Session = Depends(get_db)):
 
 # SQL execution endpoint
 @app.post("/api/execute-sql", response_model=CodeExecutionResponse)
-async def execute_sql_code(request: CodeExecutionRequest):
-    """Execute SQL query"""
+async def execute_sql_code(request: CodeExecutionRequest, db: Session = Depends(get_db)):
+    """Execute SQL query with DuckDB"""
     try:
-        success, output, error = sql_executor.execute_query(request.code)
+        # Get or create session-specific SQL executor
+        session_id = request.session_id or "default"
+        
+        if session_id not in sql_executors:
+            # Fetch session to get problem_id
+            session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
+            
+            if session and session.problem_id:
+                # Get allowed tables for this problem
+                allowed_tables = get_problem_table_names(session.problem_id)
+                
+                # Create executor with problem context
+                executor = SQLExecutor(
+                    session_id=session_id,
+                    problem_id=session.problem_id,
+                    allowed_tables=allowed_tables
+                )
+                
+                # Load problem data into DuckDB
+                load_problem_to_duckdb(session.problem_id, executor.conn)
+                
+                sql_executors[session_id] = executor
+            else:
+                # Fallback: no problem_id (legacy mode)
+                sql_executors[session_id] = SQLExecutor(session_id=session_id)
+        
+        executor = sql_executors[session_id]
+        success, rows, column_names, execution_time, error = executor.execute_query(request.code)
+        
+        # Log SQL_RUN event if session_id provided
+        if request.session_id and success:
+            try:
+                # Get next sequence number
+                last_event = db.query(Event).filter(
+                    Event.session_id == request.session_id
+                ).order_by(Event.sequence_number.desc()).first()
+                next_sequence = (last_event.sequence_number + 1) if last_event else 1
+                
+                sql_event = Event(
+                    session_id=request.session_id,
+                    event_type="SQL_RUN",
+                    event_metadata={
+                        "query_text": request.code,
+                        "execution_time": execution_time,
+                        "row_count": len(rows),
+                        "success": True
+                    },
+                    sequence_number=next_sequence
+                )
+                db.add(sql_event)
+                db.commit()
+            except Exception as log_error:
+                logger.error(f"Failed to log SQL_RUN event: {log_error}")
+        
+        # Log errors
+        if request.session_id and not success:
+            try:
+                last_event = db.query(Event).filter(
+                    Event.session_id == request.session_id
+                ).order_by(Event.sequence_number.desc()).first()
+                next_sequence = (last_event.sequence_number + 1) if last_event else 1
+                
+                error_event = Event(
+                    session_id=request.session_id,
+                    event_type="SQL_RUN",
+                    event_metadata={
+                        "query_text": request.code,
+                        "execution_time": execution_time,
+                        "success": False,
+                        "error_message": error
+                    },
+                    sequence_number=next_sequence
+                )
+                db.add(error_event)
+                db.commit()
+            except Exception as log_error:
+                logger.error(f"Failed to log SQL error event: {log_error}")
+        
+        # Format output message for display
+        output_msg = ""
+        if success and rows:
+            output_msg = f"Query executed successfully. {len(rows)} row(s) returned in {execution_time:.3f}s"
+        elif success:
+            output_msg = f"Query executed successfully in {execution_time:.3f}s"
+        
         return CodeExecutionResponse(
             success=success,
-            output=output,
-            error=error
+            output=output_msg,
+            error=error,
+            rows=rows if success else None,
+            column_names=column_names if success else None,
+            execution_time=execution_time,
+            row_count=len(rows) if success else None
         )
     except Exception as e:
+        logger.error(f"SQL execution error: {e}")
         return CodeExecutionResponse(
             success=False,
             output="",
-            error=f"Execution error: {str(e)}"
+            error=f"Execution error: {str(e)}",
+            rows=None,
+            column_names=None,
+            execution_time=0.0,
+            row_count=0
         )
 
 # Get database schema endpoint
 @app.get("/api/database-schema")
-async def get_database_schema():
+async def get_database_schema(session_id: Optional[str] = None):
     """Get database schema information"""
     try:
-        schema = sql_executor.get_schema_info()
+        # Get or create session-specific SQL executor
+        sid = session_id or "default"
+        if sid not in sql_executors:
+            sql_executors[sid] = SQLExecutor(session_id=sid)
+        
+        schema = sql_executors[sid].get_schema_info()
         return {"schema": schema}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching schema: {str(e)}")

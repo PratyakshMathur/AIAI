@@ -1,5 +1,6 @@
-"""Python data loader for interview environment"""
+"""Python and DuckDB data loader for interview environment"""
 import pandas as pd
+import duckdb
 import io
 
 def get_sample_dataframe():
@@ -28,6 +29,18 @@ def get_sample_dataframe():
     orders_df = pd.read_csv(io.StringIO(orders_data))
     
     return customers_df, orders_df
+
+def load_duckdb_data(conn: duckdb.DuckDBPyConnection):
+    """Load sample data into a DuckDB connection"""
+    customers_df, orders_df = get_sample_dataframe()
+    
+    # Register DataFrames as DuckDB tables
+    conn.register('customers', customers_df)
+    conn.register('orders', orders_df)
+    
+    # Create persistent tables from registered DataFrames
+    conn.execute('CREATE TABLE IF NOT EXISTS customers AS SELECT * FROM customers')
+    conn.execute('CREATE TABLE IF NOT EXISTS orders AS SELECT * FROM orders')
 
 # Export data loading code as string for execution
 SAMPLE_DATA_CODE = '''import pandas as pd
@@ -61,3 +74,4 @@ print(f"\\nCustomers: {len(customers)} rows")
 print(f"Orders: {len(orders)} rows")
 print("\\nUse 'customers' and 'orders' DataFrames for analysis")
 '''
+

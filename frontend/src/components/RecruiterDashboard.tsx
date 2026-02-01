@@ -62,6 +62,8 @@ const RecruiterDashboard: React.FC<RecruiterDashboardProps> = ({ sessionId, onBa
   const [events, setEvents] = useState<Event[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [aiInsights, setAiInsights] = useState<any>(null);
+  const [loadingInsights, setLoadingInsights] = useState(false);
 
   // Component-level ResizeObserver error suppression
   useEffect(() => {
@@ -129,6 +131,11 @@ const RecruiterDashboard: React.FC<RecruiterDashboardProps> = ({ sessionId, onBa
       setSession(sessionData);
       setFeatures(featuresData);
       setEvents(eventsData);
+      
+      // Load AI insights if available
+      if (sessionData.ai_insights) {
+        setAiInsights(sessionData.ai_insights);
+      }
     } catch (err) {
       setError('Failed to load dashboard data');
       console.error('Dashboard error:', err);
@@ -177,6 +184,31 @@ const RecruiterDashboard: React.FC<RecruiterDashboardProps> = ({ sessionId, onBa
     acc[event.event_type] = (acc[event.event_type] || 0) + 1;
     return acc;
   }, {} as Record<string, number>);
+
+  const handleAnalyzeSession = async () => {
+    if (!selectedSessionId) return;
+    
+    setLoadingInsights(true);
+    try {
+      const response = await fetch(`http://localhost:8000/api/sessions/${selectedSessionId}/analyze`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        }
+      });
+      
+      if (response.ok) {
+        const insights = await response.json();
+        setAiInsights(insights);
+      } else {
+        console.error('Failed to analyze session');
+      }
+    } catch (error) {
+      console.error('Error analyzing session:', error);
+    } finally {
+      setLoadingInsights(false);
+    }
+  };
 
   if (loading) {
     return (
@@ -385,6 +417,176 @@ const RecruiterDashboard: React.FC<RecruiterDashboardProps> = ({ sessionId, onBa
             <p className="text-sm text-gray-600">Times code was executed</p>
           </div>
         </div>
+
+        {/* AI Insights Section */}
+        {!aiInsights && (
+          <div className="bg-white rounded-lg shadow p-6 text-center">
+            <h2 className="text-lg font-semibold text-gray-800 mb-4">🤖 AI-Powered Analysis</h2>
+            <p className="text-gray-600 mb-4">
+              Get comprehensive insights about the candidate's performance, strengths, and areas for improvement
+            </p>
+            <button
+              onClick={handleAnalyzeSession}
+              disabled={loadingInsights}
+              className="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {loadingInsights ? (
+                <div className="flex items-center space-x-2">
+                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                  <span>Analyzing Session...</span>
+                </div>
+              ) : (
+                '✨ Generate AI Insights'
+              )}
+            </button>
+          </div>
+        )}
+
+        {aiInsights && (
+          <div className="space-y-4">
+            {/* Overall Score & Recommendation */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="bg-white rounded-lg shadow p-6">
+                <h3 className="text-lg font-semibold text-gray-800 mb-4">Overall Score</h3>
+                <div className="flex items-center justify-center">
+                  <div className="text-6xl font-bold text-blue-600">
+                    {Math.round(aiInsights.overall_score * 100)}
+                  </div>
+                  <div className="ml-2 text-2xl text-gray-500">/ 100</div>
+                </div>
+                <div className="mt-4 text-center">
+                  <span className={`px-4 py-2 rounded-full text-sm font-semibold ${
+                    aiInsights.overall_score >= 0.8 ? 'bg-green-100 text-green-800' :
+                    aiInsights.overall_score >= 0.6 ? 'bg-yellow-100 text-yellow-800' :
+                    'bg-red-100 text-red-800'
+                  }`}>
+                    {getScoreLabel(aiInsights.overall_score)}
+                  </span>
+                </div>
+              </div>
+
+              <div className="bg-white rounded-lg shadow p-6">
+                <h3 className="text-lg font-semibold text-gray-800 mb-4">Hire Recommendation</h3>
+                <div className="text-2xl font-bold text-gray-900 mb-2">
+                  {aiInsights.hire_recommendation}
+                </div>
+                {aiInsights.detailed_insights && (
+                  <p className="text-gray-600 text-sm">{aiInsights.detailed_insights.substring(0, 150)}...</p>
+                )}
+              </div>
+            </div>
+
+            {/* Dimension Scores */}
+            {aiInsights.dimension_scores && (
+              <div className="bg-white rounded-lg shadow p-6">
+                <h3 className="text-lg font-semibold text-gray-800 mb-4">Skill Dimensions</h3>
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                  {Object.entries(aiInsights.dimension_scores).map(([dimension, score]: [string, any]) => (
+                    <div key={dimension} className="border rounded-lg p-4">
+                      <div className="text-sm text-gray-600 mb-2 capitalize">
+                        {dimension.replace(/_/g, ' ')}
+                      </div>
+                      <div className="flex items-end space-x-2">
+                        <div className="text-2xl font-bold text-gray-900">
+                          {Math.round(score * 100)}
+                        </div>
+                        <div className="text-sm text-gray-500 pb-1">/ 100</div>
+                      </div>
+                      <div className="w-full bg-gray-200 rounded-full h-2 mt-2">
+                        <div 
+                          className={`h-2 rounded-full ${
+                            score >= 0.8 ? 'bg-green-500' :
+                            score >= 0.6 ? 'bg-yellow-500' :
+                            'bg-red-500'
+                          }`}
+                          style={{ width: `${score * 100}%` }}
+                        ></div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Strengths & Improvements */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {aiInsights.key_strengths && aiInsights.key_strengths.length > 0 && (
+                <div className="bg-white rounded-lg shadow p-6">
+                  <h3 className="text-lg font-semibold text-gray-800 mb-4 flex items-center">
+                    <span className="mr-2">✅</span> Key Strengths
+                  </h3>
+                  <ul className="space-y-2">
+                    {aiInsights.key_strengths.map((strength: string, idx: number) => (
+                      <li key={idx} className="flex items-start">
+                        <span className="text-green-500 mr-2">•</span>
+                        <span className="text-gray-700">{strength}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {aiInsights.areas_for_improvement && aiInsights.areas_for_improvement.length > 0 && (
+                <div className="bg-white rounded-lg shadow p-6">
+                  <h3 className="text-lg font-semibold text-gray-800 mb-4 flex items-center">
+                    <span className="mr-2">📈</span> Areas for Improvement
+                  </h3>
+                  <ul className="space-y-2">
+                    {aiInsights.areas_for_improvement.map((area: string, idx: number) => (
+                      <li key={idx} className="flex items-start">
+                        <span className="text-orange-500 mr-2">•</span>
+                        <span className="text-gray-700">{area}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            {/* Red Flags & Standout Moments */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {aiInsights.red_flags && aiInsights.red_flags.length > 0 && (
+                <div className="bg-red-50 rounded-lg shadow p-6 border border-red-200">
+                  <h3 className="text-lg font-semibold text-red-800 mb-4 flex items-center">
+                    <span className="mr-2">⚠️</span> Red Flags
+                  </h3>
+                  <ul className="space-y-2">
+                    {aiInsights.red_flags.map((flag: string, idx: number) => (
+                      <li key={idx} className="flex items-start">
+                        <span className="text-red-500 mr-2">•</span>
+                        <span className="text-red-700">{flag}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {aiInsights.standout_moments && aiInsights.standout_moments.length > 0 && (
+                <div className="bg-blue-50 rounded-lg shadow p-6 border border-blue-200">
+                  <h3 className="text-lg font-semibold text-blue-800 mb-4 flex items-center">
+                    <span className="mr-2">⭐</span> Standout Moments
+                  </h3>
+                  <ul className="space-y-2">
+                    {aiInsights.standout_moments.map((moment: string, idx: number) => (
+                      <li key={idx} className="flex items-start">
+                        <span className="text-blue-500 mr-2">•</span>
+                        <span className="text-blue-700">{moment}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            {/* Detailed Insights */}
+            {aiInsights.detailed_insights && (
+              <div className="bg-white rounded-lg shadow p-6">
+                <h3 className="text-lg font-semibold text-gray-800 mb-4">Detailed Analysis</h3>
+                <p className="text-gray-700 whitespace-pre-wrap">{aiInsights.detailed_insights}</p>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Feature Scores */}
         <div className="bg-white rounded-lg shadow">

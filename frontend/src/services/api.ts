@@ -22,6 +22,7 @@ export interface SessionCreate {
   candidate_name: string;
   interviewer_name?: string;
   problem_statement: string;
+  problem_id?: number;  // NEW
   session_data?: Record<string, any>;
 }
 
@@ -30,9 +31,27 @@ export interface Session {
   candidate_name: string;
   interviewer_name?: string;
   problem_statement: string;
+  problem_id?: number;
   start_time: string;
   end_time?: string;
   status: string;
+  phase?: string;
+  submitted_at?: string;
+  ai_insights?: any;
+}
+
+export interface Problem {
+  id: number;
+  title: string;
+  description: string;
+  difficulty: string;
+  created_at: string;
+  table_count?: number;
+  tables?: Array<{
+    name: string;
+    schema: Array<{ name: string; type: string }>;
+    row_count: number;
+  }>;
 }
 
 export interface EventCreate {
@@ -100,6 +119,17 @@ class ApiService {
   // Features endpoint
   async getSessionFeatures(sessionId: string): Promise<Feature[]> {
     const response = await api.get(`/sessions/${sessionId}/features`);
+    return response.data;
+  }
+
+  // Problem endpoints
+  async getAllProblems(): Promise<Problem[]> {
+    const response = await api.get('/problems');
+    return response.data;
+  }
+
+  async getProblem(problemId: number): Promise<Problem> {
+    const response = await api.get(`/problems/${problemId}`);
     return response.data;
   }
 }

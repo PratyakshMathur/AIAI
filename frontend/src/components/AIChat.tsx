@@ -16,13 +16,17 @@ interface AIChatProps {
   codeContext?: string;
   errorContext?: string;
   onResponseUsed?: (interactionId: string) => void;
+  mode?: 'coding' | 'interview';
+  initialQuestion?: string | null;
 }
 
 const AIChat: React.FC<AIChatProps> = ({
   sessionId,
   codeContext,
   errorContext,
-  onResponseUsed
+  onResponseUsed,
+  mode = 'coding',
+  initialQuestion = null
 }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
@@ -42,6 +46,20 @@ const AIChat: React.FC<AIChatProps> = ({
     }
   }, [messages.length]);
 
+  // Add initial interview question when mode changes to interview
+  useEffect(() => {
+    if (mode === 'interview' && initialQuestion && messages.length === 0) {
+      const aiMessage: Message = {
+        id: 'initial-question',
+        type: 'ai',
+        content: initialQuestion,
+        timestamp: new Date(),
+        intent: 'interview'
+      };
+      setMessages([aiMessage]);
+    }
+  }, [mode, initialQuestion]);
+
   const handleSendMessage = async () => {
     if (!inputValue.trim() || isLoading) return;
 
@@ -54,8 +72,12 @@ const AIChat: React.FC<AIChatProps> = ({
 
     setMessages(prev => [...prev, userMessage]);
     
-    // Track AI prompt
-    eventTracker.trackAIPrompt(inputValue);
+    // Track AI prompt (different events for coding vs interview)
+    if (mode === 'interview') {
+      eventTracker.trackInterviewAnswer(inputValue);
+    } else {
+      eventTracker.trackAIPrompt(inputValue);
+    }
     
     const promptText = inputValue;
     setInputValue('');
@@ -66,62 +88,39 @@ const AIChat: React.FC<AIChatProps> = ({
       const contextData: Record<string, any> = {};
       if (codeContext) contextData.code = codeContext;
       if (errorContext) contextData.error = errorContext;
+      contextData.mode = mode;
 
-      // For now, create a mock response since backend AI might not be configured
-      // TODO: Uncomment when backend AI is properly set up
-      /*
+      // Call backend AI
       const response = await apiService.sendAIPrompt({
         session_id: sessionId,
         user_prompt: promptText,
         context_data: contextData
       });
-      */
       
       // Smart AI response based on context and user input
-      let aiResponse = '';
-      const userInput = promptText.toLowerCase();
-      
-      if (userInput.includes('syntax') && userInput.includes('print')) {
-        aiResponse = "The syntax for print in Python is: `print(your_message)` or `print(variable_name)`. For example: `print(\"Hello World\")` or `print(df.head())` to display data.";
-      } else if (userInput.includes('data') || userInput.includes('csv') || userInput.includes('load')) {
-        aiResponse = "To work with the customer data, try these commands:\n\n1. `df = pd.read_csv('customer_data.csv')` - Load the data\n2. `df.head()` - See first few rows\n3. `df.shape` - Check dimensions\n4. `df.describe()` - Get statistical summary\n5. `df.columns` - See column names";
-      } else if (userInput.includes('pandas') || userInput.includes('analysis')) {
-        aiResponse = "For data analysis with pandas:\n\n• `df.groupby('category').mean()` - Group by category\n• `df['column_name'].unique()` - Unique values\n• `df.isnull().sum()` - Check missing values\n• `df.plot()` - Create visualizations\n\nWhat specific analysis would you like to perform?";
-      } else if (userInput.includes('help')) {
-        aiResponse = "I'm here to help with your data analysis challenge! I can assist with:\n\n📊 Data exploration and loading\n🔍 Statistical analysis techniques\n📈 Visualization suggestions\n🐍 Python/pandas syntax\n💡 Analysis approach guidance\n\nWhat specific aspect would you like help with?";
-      } else if (userInput.includes('error') || userInput.includes('problem')) {
-        aiResponse = "I can help debug issues! Common data analysis problems:\n\n• **Import errors**: Make sure pandas is imported\n• **File not found**: Check the file path\n• **Column errors**: Verify column names with `df.columns`\n• **Data types**: Use `df.dtypes` to check formats\n\nWhat error are you encountering?";
-      } else if (userInput.includes('visualiz') || userInput.includes('plot') || userInput.includes('chart')) {
-        aiResponse = "Great! For visualizations try:\n\n📊 `df['column'].hist()` - Histogram\n📈 `df.plot(x='col1', y='col2')` - Line plot\n🟩 `df['category'].value_counts().plot(kind='bar')` - Bar chart\n🥧 `df['category'].value_counts().plot(kind='pie')` - Pie chart\n\nWhat type of chart would work best for your analysis?";
-      } else {
-        // Fallback contextual responses
-        const contextResponses = [
-          "I can help you with the customer data analysis! What specific aspect would you like to explore?",
-          "Looking at your data challenge, I'd suggest starting with `df.head()` to examine the structure. What's your next step?",
-          "For this e-commerce analysis, consider exploring customer segments by age and purchase patterns. Need guidance?",
-          "The marketing team wants insights on customer behavior. Would you like help with grouping or visualization techniques?",
-          "This transaction data has great potential! Are you looking to analyze purchase trends or customer segments?"
-        ];
-        aiResponse = contextResponses[Math.floor(Math.random() * contextResponses.length)];
-      }
+      let aiResponse = response.response || '';
       
       const aiMessage: Message = {
         id: (Date.now() + 1).toString(),
         type: 'ai',
         content: aiResponse,
         timestamp: new Date(),
-        interactionId: 'mock-' + Date.now(),
-        intent: 'help'
+        interactionId: response.interaction_id || 'id-' + Date.now(),
+        intent: response.intent || 'help'
       };
 
       setMessages(prev => [...prev, aiMessage]);
       
       // Track AI response
-      eventTracker.trackAIResponse(
-        aiResponse, 
-        'help', 
-        'mock-' + Date.now()
-      );
+      if (mode === 'interview') {
+        eventTracker.trackInterviewQuestion(aiResponse);
+      } else {
+        eventTracker.trackAIResponse(
+          aiResponse, 
+          response.intent || 'help', 
+          response.interaction_id || 'id-' + Date.now()
+        );
+      }
 
     } catch (error: any) {
       console.error('Error sending AI prompt:', error);
@@ -181,8 +180,12 @@ const AIChat: React.FC<AIChatProps> = ({
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.length === 0 && (
           <div className="text-center text-gray-500 mt-8">
-            <div className="text-2xl mb-2">🤖</div>
-            <p className="text-sm">I can help explain concepts, debug issues, and suggest approaches</p>
+            <div className="text-2xl mb-2">{mode === 'interview' ? '🎤' : '🤖'}</div>
+            <p className="text-sm">
+              {mode === 'interview' 
+                ? "Interview mode: I'll ask you questions about your approach and code" 
+                : "I can help explain concepts, debug issues, and suggest approaches"}
+            </p>
           </div>
         )}
         
